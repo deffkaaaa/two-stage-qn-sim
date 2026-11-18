@@ -8,7 +8,7 @@
     <artifactId>two-stage-qn-sim</artifactId>
     <version>1.0</version>
     <packaging>jar</packaging>
-    <name>Імітаційна модель двостадійної обробки деталей з браком (МСО)</name>
+    <name>Імітаційна модель двофазної обробки деталей з браком (ММО)</name>
 
     <properties>
         <maven.compiler.release>17</maven.compiler.release>

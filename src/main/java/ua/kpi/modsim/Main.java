@@ -33,7 +33,7 @@ public class Main {
             } catch (Exception ignored) {
                 // залишається стандартний вигляд
             }
-            JFrame frame = new JFrame("Імітаційна модель двостадійної обробки деталей з браком");
+            JFrame frame = new JFrame("Імітаційна модель двофазної обробки деталей з браком");
             frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
             frame.setContentPane(new AppPanel());
             frame.pack();

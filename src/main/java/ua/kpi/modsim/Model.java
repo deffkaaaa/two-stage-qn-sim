@@ -5,11 +5,14 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Імітаційна модель двостадійної обробки деталей з браком (МСО з розділу 2).
+ * Імітаційна модель двофазної обробки деталей з браком як мережа масового обслуговування (розділ 2).
  *
- * <p>Алгоритм: модельний час просувається до найближчої події; з одночасних подій
- * обирається випадкова; після кожної події виконуються всі переходи нульової тривалості
- * (метод {@link #settle()}), доки стан системи змінюється.
+ * <p>Мережа складається з джерела I0, шести СМО (D0 з чергою Q0, P1, P2 з чергою QR, DS з чергою QS, S1, S2)
+ * і двох виходів (W, F). Маршрути задано між СМО з імовірностями та умовами блокування.
+ *
+ * <p>Алгоритм: модельний час просувається до найближчої події tNext серед елементів; подія - це
+ * {@link Element#outAct()} одного елемента, однаково реалізована для всіх елементів. З одночасних подій
+ * обирається випадкова (у детермінованому режимі - перша за порядком).
  */
 public class Model {
     private final Params prm;
@@ -19,17 +22,13 @@ public class Model {
     // стан і елементи мережі (рисунок 2.1)
     private double t = 0;
     private int idSeq = 0;
-    private final PartQueue q0 = new PartQueue("Q0");
-    private final PartQueue qR = new PartQueue("QR");
-    private final PartQueue qS = new PartQueue("QS");
-    private final Source source;
-    private final Server p1, p2, s1, s2;
-    private final Dispatcher d0, dS;
-    private final List<Element> eventElements = new ArrayList<>();
+    private final Create source;
+    private final Process d0, p1, p2, dS, s1, s2;
+    private final Dispose waste, finished;
+    /** Порядок важливий для детермінованого режиму: спершу СМО з нульовим часом, далі решта. */
+    private final List<Element> elements = new ArrayList<>();
 
-    // лічильники за весь час (для балансу) та за період спостереження
-    private long totArrived, totWaste, totOk, totDone;
-    private long wArrived, wWaste, wOk, wFirstP1, wFirstP2;
+    // лічильники за період спостереження та облік середньої L_S
     private double areaLs;
     private double windowStart;
 
@@ -44,38 +43,49 @@ public class Model {
         this.prm = prm;
         this.smp = smp;
         this.log = log;
-        source = new Source(this, smp, prm.meanArrival());
-        p1 = new Server("P1", "P1", this, smp, prm.meanP1(), this::afterP1);
-        p2 = new Server("P2", "P2", this, smp, prm.meanP2(), this::afterP2);
-        s1 = new Server("S1", "S", this, smp, prm.meanS(), this::afterS);
-        s2 = new Server("S2", "S", this, smp, prm.meanS(), this::afterS);
-        eventElements.addAll(List.of(source, p1, p2, s1, s2));
 
-        d0 = new Dispatcher("D0", q0, this);
-        d0.addRoute("P1", this::startP1, this::bP1);
-        d0.addRoute("P2", this::startP2New, this::bP2);
-        dS = new Dispatcher("DS", qS, this);
-        dS.addRoute("S1", s1::start, this::bS1);
-        dS.addRoute("S2", s2::start, this::bS2);
+        source = new Create("I0", this, smp, prm.meanArrival());
+        d0 = new Process("D0", "D0", this, smp, 0, Integer.MAX_VALUE);   // Q0 + D0, t = 0
+        p1 = new Process("P1", "P1", this, smp, prm.meanP1(), 0);         // без черги
+        p2 = new Process("P2", "P2", this, smp, prm.meanP2(), Integer.MAX_VALUE); // з чергою QR
+        dS = new Process("DS", "DS", this, smp, 0, Integer.MAX_VALUE);   // QS + DS, t = 0
+        s1 = new Process("S1", "S", this, smp, prm.meanS(), 0);
+        s2 = new Process("S2", "S", this, smp, prm.meanS(), 0);
+        waste = new Dispose("W", this);
+        finished = new Dispose("F", this);
+        elements.addAll(List.of(d0, dS, source, p1, p2, s1, s2, waste, finished));
+
+        source.setNext(d0);
+        d0.addRoute(Route.to(p1, 1).blockedIf(this::bP1));
+        d0.addRoute(Route.to(p2, 1).blockedIf(this::bP2));
+        p1.addRoute(Route.to(dS, 1 - prm.p1()));
+        p1.addRoute(Route.to(p2, prm.p1()).doing(x -> x.setTheta(2)));
+        p2.addRoute(Route.to(dS, 1 - prm.p2()));
+        p2.addRoute(Route.to(p2, prm.p2()).blockedIf(this::bRet).doing(x -> x.setTheta(2)));
+        p2.addRoute(Route.to(waste, prm.p2()).blockedIf(this::bW));
+        dS.addRoute(Route.to(s1, 1).blockedIf(this::bS1));
+        dS.addRoute(Route.to(s2, 1).blockedIf(this::bS2));
+        s1.addRoute(Route.to(finished, 1));
+        s2.addRoute(Route.to(finished, 1));
     }
 
     // ------------------------------------------------------------------
     // Умови блокування маршрутів, формули (2.1)-(2.7)
     // ------------------------------------------------------------------
 
-    /** (2.1) L_S = q_S + g_S: деталі, що очікують на вторинну обробку (разом із деталлю в DS). */
+    /** (2.1) L_S = q_S + g_S: заявки, що очікують на вторинну обробку (разом із заявкою в каналі DS). */
     int lS() {
-        return qS.size() + (dS.holds() ? 1 : 0);
+        return dS.queueSize() + (dS.isBusy() ? 1 : 0);
     }
 
     /** (2.2) маршрут D0 -> P1 заблоковано, якщо P1 зайнятий. */
-    boolean bP1() {
+    boolean bP1(Part x) {
         return p1.isBusy();
     }
 
     /** (2.3) маршрут D0 -> P2 заблоковано, якщо P1 вільний, або P2 зайнятий, або в QR є деталі. */
-    boolean bP2() {
-        return !p1.isBusy() || p2.isBusy() || qR.size() > 0;
+    boolean bP2(Part x) {
+        return !p1.isBusy() || p2.isBusy() || p2.queueSize() > 0;
     }
 
     /** (2.4) повернення в QR заблоковано для деталі, що пройшла обробку вдруге. */
@@ -89,112 +99,27 @@ public class Model {
     }
 
     /** (2.6) маршрут DS -> S1 заблоковано, якщо S1 зайнятий. */
-    boolean bS1() {
+    boolean bS1(Part x) {
         return s1.isBusy();
     }
 
     /** (2.7) маршрут DS -> S2 заблоковано, якщо S1 вільний, або S2 зайнятий, або L_S <= H. */
-    boolean bS2() {
+    boolean bS2(Part x) {
         return !s1.isBusy() || s2.isBusy() || lS() <= prm.threshold();
     }
 
-    // ------------------------------------------------------------------
-    // Події та маршрутизація
-    // ------------------------------------------------------------------
-
     double now() {
         return t;
+    }
+
+    Part newPart() {
+        return new Part(++idSeq);
     }
 
     void log(String s) {
         if (log != null) {
             log.println(s);
         }
-    }
-
-    /** Надходження нової деталі: стає в чергу Q0. */
-    void onArrival() {
-        Part x = new Part(++idSeq);
-        q0.add(x);
-        totArrived++;
-        wArrived++;
-        log("  " + x + ": надходження, черга Q0");
-    }
-
-    private void startP1(Part x) {
-        wFirstP1++;
-        p1.start(x);
-    }
-
-    private void startP2New(Part x) {
-        wFirstP2++;
-        p2.start(x);
-    }
-
-    /** Завершення обробки на P1: брак 0,04 -> QR (тип 2), інакше в накопичувач. */
-    private void afterP1(Part x) {
-        if (smp.defect("P1", prm.p1())) {
-            x.setTheta(2);
-            qR.add(x);
-            log("  " + x + ": P1 -> брак, QR");
-        } else {
-            toStorage(x, "P1");
-        }
-    }
-
-    /** Завершення обробки на P2: брак 0,08, далі маршрут за умовами (2.4), (2.5). */
-    private void afterP2(Part x) {
-        if (!smp.defect("P2", prm.p2())) {
-            toStorage(x, "P2");
-            return;
-        }
-        boolean toReturn = !bRet(x);
-        boolean toWaste = !bW(x);
-        if (toReturn == toWaste) {
-            throw new IllegalStateException("Умови (2.4) і (2.5) мають бути взаємовиключними");
-        }
-        if (toReturn) {
-            x.setTheta(2);
-            qR.add(x);
-            log("  " + x + ": P2 -> брак (перший), QR");
-        } else {
-            totWaste++;
-            wWaste++;
-            log("  " + x + ": P2 -> брак (повторний), ВІДХОДИ");
-        }
-    }
-
-    private void toStorage(Part x, String from) {
-        qS.add(x);
-        totOk++;
-        wOk++;
-        log("  " + x + ": " + from + " -> придатна, накопичувач QS");
-    }
-
-    private void afterS(Part x) {
-        totDone++;
-        log("  " + x + ": вторинну обробку завершено");
-    }
-
-    /** Верстат P2 бере деталь із черги повторної обробки QR (пріоритет над новими деталями). */
-    private boolean startP2FromQueue() {
-        if (!p2.isBusy() && !qR.isEmpty()) {
-            Part x = qR.poll();
-            log("  " + x + ": QR -> P2 (повторна обробка)");
-            p2.start(x);
-            return true;
-        }
-        return false;
-    }
-
-    /** Усі переходи нульової тривалості, поки стан системи змінюється. */
-    private void settle() {
-        boolean changed;
-        do {
-            changed = startP2FromQueue();
-            changed |= d0.step();
-            changed |= dS.step();
-        } while (changed);
     }
 
     // ------------------------------------------------------------------
@@ -204,11 +129,11 @@ public class Model {
     /** Вибір найближчої події; з одночасних - випадкова (пункт методички). */
     private Element chooseNext() {
         double min = Double.POSITIVE_INFINITY;
-        for (Element e : eventElements) {
+        for (Element e : elements) {
             min = Math.min(min, e.tNext());
         }
         List<Element> cand = new ArrayList<>();
-        for (Element e : eventElements) {
+        for (Element e : elements) {
             if (e.tNext() == min) {
                 cand.add(e);
             }
@@ -224,20 +149,18 @@ public class Model {
         return chosen;
     }
 
-    /** Просування часу на dt зі статистикою за станом, що діяв на цьому інтервалі (нерівні інтервали). */
-    private void advance(double dt) {
+    /** Просування часу до моменту to зі статистикою за станом, що діяв на інтервалі (нерівні інтервали). */
+    private void advance(double to) {
+        double dt = to - t;
         if (dt > 0) {
-            for (Element e : eventElements) {
+            for (Element e : elements) {
                 e.doStatistics(dt);
             }
-            q0.doStatistics(dt);
-            qR.doStatistics(dt);
-            qS.doStatistics(dt);
             areaLs += lS() * dt;
             if (sampleStep > 0) {
                 sampleWindows(dt);
             }
-            t += dt;
+            t = to;
         }
     }
 
@@ -284,14 +207,10 @@ public class Model {
     }
 
     private void resetStatistics() {
-        for (Element e : eventElements) {
+        for (Element e : elements) {
             e.resetStatistics();
         }
-        q0.resetStatistics();
-        qR.resetStatistics();
-        qS.resetStatistics();
         areaLs = 0;
-        wArrived = wWaste = wOk = wFirstP1 = wFirstP2 = 0;
         windowStart = t;
     }
 
@@ -310,18 +229,17 @@ public class Model {
             Element next = chooseNext();
             double tn = next.tNext();
             if (!warmDone && tn > warmup) {
-                advance(warmup - t);
+                advance(warmup);
                 resetStatistics();
                 warmDone = true;
             }
             if (tn > tMod) {
-                advance(tMod - t);
+                advance(tMod);
                 break;
             }
-            advance(tn - t);
+            advance(tn);
             log(String.format(Locale.ROOT, "t=%.3f: %s", t, next.name()));
             next.outAct();
-            settle();
             logState();
         }
         return collect(tMod - windowStart);
@@ -334,26 +252,33 @@ public class Model {
     private void logState() {
         log(String.format(Locale.ROOT,
                 "     стан: Q0=%d D0=%s P1=%s P2=%s QR=%d | QS=%d DS=%s S1=%s S2=%s | L_S=%d",
-                q0.size(), part(d0.held()), part(p1.current()), part(p2.current()), qR.size(),
-                qS.size(), part(dS.held()), part(s1.current()), part(s2.current()), lS()));
+                d0.queueSize(), part(d0.current()), part(p1.current()), part(p2.current()), p2.queueSize(),
+                dS.queueSize(), part(dS.current()), part(s1.current()), part(s2.current()), lS()));
     }
 
     private int inSystem() {
-        return q0.size() + (d0.holds() ? 1 : 0) + (p1.isBusy() ? 1 : 0) + (p2.isBusy() ? 1 : 0) + qR.size()
-                + qS.size() + (dS.holds() ? 1 : 0) + (s1.isBusy() ? 1 : 0) + (s2.isBusy() ? 1 : 0);
+        int n = 0;
+        for (Process p : List.of(d0, p1, p2, dS, s1, s2)) {
+            n += p.queueSize() + (p.isBusy() ? 1 : 0);
+        }
+        return n;
     }
 
     /** Баланс деталей за весь час: надійшло = відходи + оброблено + у системі. */
     public boolean balanceOk() {
-        return totArrived == totWaste + totDone + inSystem();
+        return source.total() == waste.total() + finished.total() + inSystem();
     }
 
     private Results collect(double tObs) {
-        double pw = (wWaste + wOk) > 0 ? (double) wWaste / (wWaste + wOk) : Double.NaN;
-        double share = (wFirstP1 + wFirstP2) > 0 ? (double) wFirstP1 / (wFirstP1 + wFirstP2) : Double.NaN;
-        return new Results(tObs, wArrived, wWaste, wOk,
+        long nOk = dS.inWindow();
+        long nW = waste.window();
+        double pw = (nW + nOk) > 0 ? (double) nW / (nW + nOk) : Double.NaN;
+        long first1 = p1.inWindow(1);
+        long first2 = p2.inWindow(1);
+        double share = (first1 + first2) > 0 ? (double) first1 / (first1 + first2) : Double.NaN;
+        return new Results(tObs, source.window(), nW, nOk,
                 p1.utilization(tObs), p2.utilization(tObs), s1.utilization(tObs), s2.utilization(tObs),
-                pw, q0.meanLength(tObs), qR.meanLength(tObs), qS.meanLength(tObs), areaLs / tObs,
+                pw, d0.meanQueue(tObs), p2.meanQueue(tObs), dS.meanQueue(tObs), areaLs / tObs,
                 share, balanceOk());
     }
 }
